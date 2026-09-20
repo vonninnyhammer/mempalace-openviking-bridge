@@ -1,0 +1,30 @@
+wing: mempalace_viking
+rooms:
+- name: bridge
+  description: Files from bridge/
+  keywords:
+  - bridge
+  - bridge
+- name: escalations
+  description: Files from escalations/
+  keywords:
+  - escalations
+  - escalations
+- name: ingest
+  description: Files from ingest/
+  keywords:
+  - ingest
+  - ingest
+- name: test_data
+  description: Files from test-data/
+  keywords:
+  - test_data
+  - test-data
+- name: logs
+  description: Files from logs/
+  keywords:
+  - logs
+  - logs
+- name: general
+  description: Files that don't fit other rooms
+  keywords: []

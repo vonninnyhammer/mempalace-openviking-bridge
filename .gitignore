@@ -1,0 +1,13 @@
+__pycache__/
+*.pyc
+.venv/
+venv/
+bridge/staging/
+bridge/.escalation_state.json
+escalations/
+logs/
+test-data/
+ingest/
+.mempalace/
+.openviking/
+*.sqlite3
