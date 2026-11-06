@@ -54,13 +54,28 @@ IDENTITY_FIELDS = ("source_file", "chunk_index", "filed_at")
 # ---------------------------------------------------------------------------
 # Layer 1: EXPORT from MemPalace
 # ---------------------------------------------------------------------------
-def export_drawers() -> list[dict]:
-    """Read every drawer from the MemPalace ChromaDB collection."""
+def export_drawers(min_importance: float = 0.0, max_drawers: int = 0) -> list[dict]:
+    """Read drawers from the MemPalace ChromaDB collection.
+
+    OpenViking generates an L0 abstract and an L1 overview per resource with a
+    CPU VLM at roughly 12s each, so pushing the whole palace is not viable
+    once it holds tens of thousands of drawers. Callers curate with
+    `min_importance` / `max_drawers`: the palace stays the full-corpus search
+    layer, and viking:// stays a small, high-signal execution-time context set.
+    """
     client = chromadb.PersistentClient(path=str(PALACE_PATH))
     col = client.get_collection(COLLECTION)
     data = col.get(include=["documents", "metadatas"])
     drawers = []
     for doc, meta in zip(data["documents"], data["metadatas"]):
+        meta = meta or {}
+        importance = meta.get("importance")
+        try:
+            importance = float(importance)
+        except (TypeError, ValueError):
+            importance = 0.0
+        if importance < min_importance:
+            continue
         drawers.append(
             {
                 "text": doc,
@@ -72,8 +87,12 @@ def export_drawers() -> list[dict]:
                 "chunk_total": meta.get("chunk_total", 1),
                 "filed_at": meta.get("filed_at", ""),
                 "entities": meta.get("entities", ""),
+                "importance": importance,
             }
         )
+    drawers.sort(key=lambda d: d["importance"], reverse=True)
+    if max_drawers and len(drawers) > max_drawers:
+        drawers = drawers[:max_drawers]
     return drawers
 
 
@@ -92,7 +111,13 @@ def stage_drawers(drawers: list[dict], full: bool = False) -> tuple[list[Path], 
 
         staging/
           resources/mempalace/{wing}/{room}/{source_stem}__{chunk}.md
-          .manifest.json   <- identity -> path map for change detection
+          .manifest.json   <- identity -> {path, sha1} for change detection
+
+    Change detection is content-aware. An earlier identity -> path map only
+    noticed added and removed drawers, so a drawer whose text was later
+    re-chunked or re-filed kept its stale staged copy forever and never
+    reached viking://. Entries written by that older format (a bare path
+    string) are treated as unknown-hash and rewritten once.
 
     Returns (changed_files, manifest).
     """
@@ -102,7 +127,10 @@ def stage_drawers(drawers: list[dict], full: bool = False) -> tuple[list[Path], 
 
     manifest = {}
     if MANIFEST.exists():
-        manifest = json.loads(MANIFEST.read_text())
+        try:
+            manifest = json.loads(MANIFEST.read_text())
+        except json.JSONDecodeError:
+            manifest = {}
 
     changed: list[Path] = []
     new_manifest = {}
@@ -121,14 +149,33 @@ def stage_drawers(drawers: list[dict], full: bool = False) -> tuple[list[Path], 
             f"filed_at={d['filed_at']} entities={d['entities']} -->\n\n"
         )
         content = header + d["text"].strip() + "\n"
+        digest = hashlib.sha1(content.encode("utf-8")).hexdigest()
 
-        if manifest.get(ident) != str(out) or not out.exists():
+        prev = manifest.get(ident)
+        prev_path = prev.get("path") if isinstance(prev, dict) else prev
+        prev_hash = prev.get("sha1") if isinstance(prev, dict) else None
+
+        if prev_path != str(out) or prev_hash != digest or not out.exists():
             out.write_text(content)
             changed.append(out)
 
-        new_manifest[ident] = str(out)
+        new_manifest[ident] = {"path": str(out), "sha1": digest}
 
     MANIFEST.write_text(json.dumps(new_manifest, indent=2))
+
+    # Drop orphaned staged files. Without this, a staging tree built by an
+    # earlier, larger run keeps files that are no longer in the manifest, so
+    # the curated set silently grows past max_drawers and the cap stops
+    # meaning anything. Only .md files are considered; .manifest.json is
+    # metadata and is never a candidate.
+    keep = {Path(p) for p in (e["path"] for e in new_manifest.values())}
+    for leftover in STAGING_DIR.rglob("*.md"):
+        if leftover not in keep:
+            leftover.unlink()
+    for d in sorted(STAGING_DIR.rglob("*"), reverse=True):
+        if d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+
     return changed, new_manifest
 
 
@@ -140,12 +187,21 @@ def _safe(name: str) -> str:
 # ---------------------------------------------------------------------------
 # Layer 2: SYNC into OpenViking
 # ---------------------------------------------------------------------------
-def sync_to_viking(changed: list[Path]) -> dict:
-    """Add the staged resource tree to OpenViking (async submit, then poll)."""
+def sync_to_viking(changed: list[Path], submit_timeout: float = 300.0) -> dict:
+    """Add the staged resource tree to OpenViking (async submit, then poll).
+
+    `wait=False` returns as soon as the job is queued, but the HTTP request
+    still blocks while the server takes the destination path lock and walks the
+    tree. That exceeded the SDK's default client timeout on a few-hundred-file
+    staging tree, so the submit gets an explicit budget; semantic processing
+    itself is polled separately by wait_processed().
+    """
     client = SyncHTTPClient(url=VIKING_URL, api_key=VIKING_KEY)
     try:
         client.initialize()
-        result = client.add_resource(path=str(STAGING_DIR), to=VIKING_ROOT, wait=False)
+        result = client.add_resource(
+            path=str(STAGING_DIR), to=VIKING_ROOT, wait=False, timeout=submit_timeout
+        )
         root_uri = result.get("root_uri", VIKING_ROOT)
         return {"root_uri": root_uri, "result": result}
     finally:
@@ -222,6 +278,18 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="MemPalace -> OpenViking bridge")
     ap.add_argument("--full", action="store_true", help="rebuild staging from scratch")
     ap.add_argument("--verify-only", action="store_true", help="only check viking:// state")
+    ap.add_argument(
+        "--min-importance",
+        type=float,
+        default=2.0,
+        help="only stage drawers at or above this L1 importance score",
+    )
+    ap.add_argument(
+        "--max-drawers",
+        type=int,
+        default=60,
+        help="cap on staged drawers, highest importance first (0 = no cap)",
+    )
     args = ap.parse_args()
 
     if args.verify_only:
@@ -229,9 +297,12 @@ def main() -> int:
         return 0
 
     t0 = time.time()
-    drawers = export_drawers()
+    drawers = export_drawers(args.min_importance, args.max_drawers)
     changed, manifest = stage_drawers(drawers, full=args.full)
-    print(f"[export] {len(drawers)} drawers from {PALACE_PATH}")
+    print(
+        f"[export] {len(drawers)} drawers from {PALACE_PATH} "
+        f"(min_importance={args.min_importance}, max_drawers={args.max_drawers})"
+    )
 
     if not changed:
         print("[stage] no changes since last sync — nothing to do")

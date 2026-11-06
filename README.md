@@ -36,16 +36,40 @@ returning junk.
 
 ## Bridge pipeline (`bridge/mempalace_viking_bridge.py`)
 
-1. **Export** — read all drawers from the MemPalace ChromaDB collection.
+1. **Export** — read drawers from the MemPalace ChromaDB collection, highest
+   `importance` first. OpenViking spends about 12 s per resource generating its
+   abstracts on a CPU VLM, so the whole palace is not pushed: `--min-importance`
+   (default 2.0) and `--max-drawers` (default 60, 0 = no cap) keep viking:// a
+   small, high-signal set while the palace stays the full-corpus search layer.
 2. **Stage** — write drawers into a staging tree laid out as
-   `viking://resources/mempalace/{wing}/{room}/...` with a SHA-256 manifest for
-   change detection.
+   `viking://resources/mempalace/{wing}/{room}/...`. The manifest records each
+   drawer's path and SHA-1, so a drawer whose text changes is restaged, and
+   staged files that fall out of the set are deleted so the cap holds.
 3. **Sync** — `add_resource(...)` to OpenViking; OpenViking generates L0/L1/L2
    via its configured embedding + VLM.
 4. **Verify** — poll the raw HTTP API for non-empty directory abstracts
    (OpenViking's SDK strips the `abstract` field; the raw API does not).
 
 Idempotent: unchanged drawers are skipped; `--full` rebuilds staging.
+
+## Capture cycle (`bridge/capture.sh`)
+
+Runs on a timer: OpenCode sessions -> MemPalace -> importance ranking.
+
+- `bridge/opencode_exporter.py` reads `opencode.db` read-only and writes one
+  transcript per session in MemPalace's `> user / assistant` format. It is
+  incremental (a session is rewritten only when its text changes); tool outputs
+  are left out, tool names and the files each session edited are kept.
+- `mempalace mine --mode convos` files them. If the local embedder is down or
+  another process holds the palace lock, mining is retried and then deferred to
+  the next cycle instead of failing.
+- `bridge/rank_drawers.py` writes the `importance` field that MemPalace's L1
+  sorts on but nothing else sets: user turns and decisions score higher than
+  tool markers, and scores decay with the age of the conversation. Set
+  `MEMPALACE_PROPER_NOUNS` to the names of your own projects to boost them.
+
+Paths default to this checkout; override with `MEMPALACE_VENV`,
+`MEMPALACE_INGEST` and `MEMPALACE_CAPTURE_LOG`.
 
 ## Escalation (`bridge/escalation_listener.py`)
 
